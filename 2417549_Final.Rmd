@@ -1,0 +1,372 @@
+---
+title: "BU52710 Predictive Analytics – Final Submission"
+author: 'Andrew Wilson Student ID: 2417549'
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 7, fig.height = 4.5)
+```
+
+# Introduction
+
+The locked ten predictor variables and model type outlined from the checkpoint are carried
+forward and remaind unchanged. The script covers: model re-training on the original data, full
+test-set evaluation (ROC curve, lift chart, profit curve), and business recommendations
+across three strategies.
+
+---
+
+# Step 1: Re-load Libraries and Reproduce Training Split
+
+```{r load-libraries}
+library(tidyverse)
+library(caret)
+library(pROC)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(car)       # for VIF
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(corrplot)
+library(gridExtra)
+```
+
+```{r load-training-data}
+# Load the original 8,000-customer dataset (training + validation)
+data_train <- read.csv("dataset_2417549_train.csv", stringsAsFactors = TRUE)
+data_train$Renewal <- factor(data_train$Renewal, levels = c("No", "Yes"))
+
+# Quick overview
+dim(data_train)
+str(data_train)
+
+# Reproduce the exact 70/30 stratified split from the checkpoint
+set.seed(2417549)
+split_index     <- createDataPartition(data_train$Renewal, p = 0.70, list = FALSE)
+train_data      <- data_train[split_index, ]
+validation_data <- data_train[-split_index, ]
+
+cat("Training set:   ", nrow(train_data),      "rows\n")
+cat("Validation set: ", nrow(validation_data), "rows\n")
+cat("Train renewal:  ", round(mean(train_data$Renewal == "Yes") * 100, 2), "%\n")
+cat("Val renewal:    ", round(mean(validation_data$Renewal == "Yes") * 100, 2), "%\n")
+
+# Verify the class balance is preserved
+train_rate <- round(prop.table(table(train_data$Renewal)) * 100, 2)
+val_rate   <- round(prop.table(table(validation_data$Renewal)) * 100, 2)
+
+balance_check <- data.frame(
+  Set        = c("Training", "Validation"),
+  No_pct     = c(train_rate["No"],  val_rate["No"]),
+  Yes_pct    = c(train_rate["Yes"], val_rate["Yes"])
+)
+kable(balance_check,
+      col.names = c("Set", "% Non-Renewal", "% Renewal"),
+      caption   = "Renewal Rate Balance Across Splits",
+      digits    = 2) %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r variable-selection}
+# LOCKED predictor variables from checkpoint – cannot be changed
+selected_vars <- c("PoundsPerIssue", "Income", "Child6.12",
+                   "TotalAmountPaid", "MonthsSince1stOrder", "TotalPaidOrders",
+                   "Child13.18", "PaidCashMagazines", "HouseholdSize", "HomeValue")
+
+train_sel <- train_data      %>% select(all_of(selected_vars), Renewal)
+val_sel   <- validation_data %>% select(all_of(selected_vars), Renewal)
+```
+
+---
+
+# Step 2: Re-train Locked Models on Original Training Data
+
+Checkpoint model is re-trained on the same training set for continuity.
+The locked final model is the **Random Forest**.
+
+```{r retrain-rf}
+set.seed(2417549)
+# Model: Random Forest – LOCKED final model
+rf_model <- randomForest(Renewal ~ ., data = train_sel,
+                         ntree = 500, mtry = 3, importance = TRUE)
+
+# Validation-set predictions (continuity check against checkpoint)
+rf_probs_val <- predict(rf_model, newdata = val_sel, type = "prob")[, "Yes"]
+rf_pred_val  <- predict(rf_model, newdata = val_sel, type = "class")
+cm_rf_val    <- confusionMatrix(rf_pred_val, val_sel$Renewal, positive = "Yes")
+roc_rf_val   <- roc(as.numeric(val_sel$Renewal) - 1, rf_probs_val)
+
+cat("Validation AUC – Random Forest:", round(auc(roc_rf_val), 4), "\n")
+```
+
+---
+
+# Step 3: Load Test Data and Generate Predictions
+
+```{r load-test-data}
+# Load the released 5,000-customer test dataset
+test_data <- read.csv("dataset_2417549_final.csv", stringsAsFactors = TRUE)
+test_data$Renewal <- factor(test_data$Renewal, levels = c("No", "Yes"))
+
+cat("Test set rows:", nrow(test_data), "\n")
+
+# Verify test set renewal distribution
+test_renewal_summary <- test_data %>%
+  count(Renewal) %>%
+  mutate(Percentage = round(n / sum(n) * 100, 2))
+
+kable(test_renewal_summary,
+      col.names = c("Renewal", "Count", "Percentage (%)"),
+      caption   = "Renewal Distribution – Test Set") %>%
+  kable_styling(full_width = FALSE)
+
+# Subset to the locked 10 predictors
+test_sel <- test_data %>% select(all_of(selected_vars), Renewal)
+```
+
+```{r test-predictions}
+# Apply the locked Random Forest to the full test set
+test_probs <- predict(rf_model, newdata = test_sel, type = "prob")[, "Yes"]
+test_pred  <- predict(rf_model, newdata = test_sel, type = "class")
+
+# Build the ranked predictions data frame
+predictions_df <- data.frame(
+  customer_id           = test_data$CustomerID,
+  predicted_probability = round(test_probs, 6)
+) %>%
+  arrange(desc(predicted_probability)) %>%
+  mutate(rank = row_number())
+
+# Write submission CSV
+write.csv(predictions_df, "2417549_Predictions.csv", row.names = FALSE)
+cat("Predictions saved: 2417549_predictions.csv\n")
+cat("Total scored:      ", nrow(predictions_df), "\n")
+```
+
+---
+
+# Step 4: Test Set Evaluation
+
+## 4.1 Confusion Matrix and Core Metrics
+
+```{r test-confusion}
+cm_test  <- confusionMatrix(test_pred, test_sel$Renewal, positive = "Yes")
+roc_test <- roc(as.numeric(test_sel$Renewal) - 1, test_probs)
+print(cm_test)
+cat("\nTest AUC:", round(auc(roc_test), 4), "\n")
+```
+
+## 4.2 Validation vs Test Performance Comparison
+
+```{r val-vs-test-table}
+perf_comparison <- data.frame(
+  Dataset     = c("Validation Set", "Test Set"),
+  Accuracy    = round(c(cm_rf_val$overall["Accuracy"],
+                        cm_test$overall["Accuracy"]), 4),
+  Sensitivity = round(c(cm_rf_val$byClass["Sensitivity"],
+                        cm_test$byClass["Sensitivity"]), 4),
+  Specificity = round(c(cm_rf_val$byClass["Specificity"],
+                        cm_test$byClass["Specificity"]), 4),
+  Precision   = round(c(cm_rf_val$byClass["Pos Pred Value"],
+                        cm_test$byClass["Pos Pred Value"]), 4),
+  AUC         = round(c(auc(roc_rf_val), auc(roc_test)), 4)
+)
+
+kable(perf_comparison,
+      col.names = c("Dataset", "Accuracy", "Sensitivity",
+                    "Specificity", "Precision", "AUC"),
+      caption   = "Random Forest Performance: Validation vs Test Set") %>%
+  kable_styling(full_width = FALSE) %>%
+  row_spec(2, bold = TRUE, background = "#D5F5E3")
+```
+
+## 4.3 ROC Curve
+
+```{r roc-test}
+plot(roc_test, col = "#1E3A8A", lwd = 2.5,
+     main = "ROC Curve – Random Forest (Test vs Validation Set)")
+plot(roc_rf_val, col = "#A0BDD8", lwd = 2, lty = 2, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "grey50")
+legend("bottomright",
+       legend = c(paste("Test Set (AUC =",       round(auc(roc_test),   3), ")"),
+                  paste("Validation Set (AUC =",  round(auc(roc_rf_val), 3), ")")),
+       col    = c("#1E3A8A", "#A0BDD8"),
+       lwd    = c(2.5, 2))
+```
+
+## 4.4 Lift Chart
+
+```{r lift-chart}
+# Build lift chart data
+lift_df <- data.frame(
+  prob   = test_probs,
+  actual = as.numeric(test_sel$Renewal == "Yes")
+) %>%
+  arrange(desc(prob)) %>%
+  mutate(
+    cum_n         = row_number(),
+    cum_renewals  = cumsum(actual),
+    pct_customers = cum_n / n() * 100,
+    lift          = (cum_renewals / cum_n) / mean(actual)
+  )
+
+lift_at_10 <- lift_df %>%
+  filter(pct_customers <= 10) %>%
+  slice_tail(n = 1) %>%
+  pull(lift)
+
+cat("Lift @ top 10%:", round(lift_at_10, 2), "\n")
+
+ggplot(lift_df, aes(x = pct_customers, y = lift)) +
+  geom_line(colour = "#1E3A8A", linewidth = 1.1) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = 10, linetype = "dashed",
+             colour = "#C0392B", linewidth = 0.8) +
+  annotate("text", x = 11.5, y = max(lift_df$lift) * 0.9,
+           label = paste0("Top 10%\nLift = ", round(lift_at_10, 1), "x"),
+           colour = "#C0392B", size = 3.2, hjust = 0) +
+  labs(title    = "Cumulative Lift Chart – Random Forest (Test Set)",
+       subtitle = "Horizontal dashed line = random selection (Lift = 1.0)",
+       x        = "Percentage of Customers Contacted (%)",
+       y        = "Lift") +
+  scale_x_continuous(breaks = seq(0, 100, 10)) +
+  theme_minimal() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 10, colour = "grey40"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+## 4.5 Profit Curve
+
+```{r profit-curve}
+cost_per_contact    <- 40
+revenue_per_renewal <- 140
+
+profit_df <- lift_df %>%
+  mutate(profit = cum_renewals * revenue_per_renewal - cum_n * cost_per_contact)
+
+opt_row <- profit_df %>% slice_max(profit, n = 1, with_ties = FALSE)
+
+ggplot(profit_df, aes(x = cum_n, y = profit)) +
+  geom_line(colour = "#1E3A8A", linewidth = 1.1) +
+  geom_hline(yintercept = 0, colour = "grey70") +
+  geom_vline(xintercept = 500, linetype = "dashed",
+             colour = "#C0392B", linewidth = 0.8) +
+  annotate("text", x = 515, y = min(profit_df$profit) * 0.5,
+           label = "Budget cap & optimal\n(n = 500)", colour = "#C0392B",
+           size = 3, hjust = 0) +
+  scale_y_continuous(labels = function(x) paste0("\u00A3", format(x, big.mark = ",", scientific = FALSE))) +
+  labs(title    = "Profit Curve - Random Forest (Test Set)",
+       subtitle = paste0("Profit at every targeting threshold; parameters: \u00A3", "40 cost, \u00A3", "140 revenue"),
+       x        = "Number of Customers Contacted",
+       y        = paste0("Estimated Profit (", "\u00A3", ")")) +
+  theme_minimal() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    plot.subtitle    = element_text(size = 10, colour = "grey40"),
+    panel.grid.minor = element_blank()
+  )
+
+cat("Budget-cap profit (n = 500):", paste0("\u00A3", format(profit_df$profit[500], big.mark = ",")), "\n")
+cat("Optimal profit    (n =", opt_row$cum_n, "):", paste0("\u00A3", format(opt_row$profit, big.mark = ",")), "\n")
+```
+
+---
+
+# Step 5: Targeting Strategies
+
+## 5.1 Strategy 1 – Full Budget (Top 500 Customers)
+
+```{r top-500-strategy}
+cost_per_contact    <- 40
+revenue_per_renewal <- 140
+
+test_ranked <- predictions_df %>%
+  left_join(test_data %>% select(CustomerID, Renewal),
+            by = c("customer_id" = "CustomerID"))
+
+top500        <- test_ranked %>% slice_head(n = 500)
+renewals_500  <- sum(top500$Renewal == "Yes")
+resp_rate_500 <- round(renewals_500 / 500 * 100, 2)
+cost_500      <- 500 * cost_per_contact
+revenue_500   <- renewals_500 * revenue_per_renewal
+profit_500    <- revenue_500 - cost_500
+
+cat("Customers targeted:", 500,           "\n")
+cat("Renewals:          ", renewals_500,  "\n")
+cat("Response rate:     ", resp_rate_500, "%\n")
+cat("Cost:              \u00A3", format(cost_500,    big.mark = ","), "\n")
+cat("Revenue:           \u00A3", format(revenue_500, big.mark = ","), "\n")
+cat("Profit:            \u00A3", format(profit_500,  big.mark = ","), "\n")
+```
+
+## 5.2 Strategy 2 – Optimal Targeting
+
+```{r optimal-strategy}
+opt_strat <- test_ranked %>%
+  mutate(
+    is_renewal   = as.numeric(Renewal == "Yes"),
+    cum_renewals = cumsum(is_renewal),
+    profit_at_n  = cum_renewals * revenue_per_renewal - rank * cost_per_contact
+  ) %>%
+  slice_max(profit_at_n, n = 1, with_ties = FALSE)
+
+opt_n        <- as.numeric(opt_strat$rank)
+opt_renewals <- as.numeric(opt_strat$cum_renewals)
+opt_profit   <- as.numeric(opt_strat$profit_at_n)
+opt_cost     <- opt_n * cost_per_contact
+opt_revenue  <- opt_renewals * revenue_per_renewal
+opt_resp     <- round(opt_renewals / opt_n * 100, 2)
+
+cat("Optimal customers: ", opt_n,        "\n")
+cat("Renewals:          ", opt_renewals, "\n")
+cat("Response rate:     ", opt_resp,     "%\n")
+cat("Cost:              \u00A3", format(opt_cost,    big.mark = ","), "\n")
+cat("Revenue:           \u00A3", format(opt_revenue, big.mark = ","), "\n")
+cat("Profit:            \u00A3", format(opt_profit,  big.mark = ","), "\n")
+```
+
+## 5.3 Strategy Comparison Table
+
+```{r strategy-comparison}
+test_renewal_rate <- mean(test_data$Renewal == "Yes")
+rand_renewals     <- round(500 * test_renewal_rate)
+rand_cost         <- 500 * cost_per_contact
+rand_revenue      <- rand_renewals * revenue_per_renewal
+rand_profit       <- rand_revenue - rand_cost
+
+strategy_tbl <- data.frame(
+  Strategy  = c("Random Selection (Baseline)",
+                "Model - Top 500 (Full Budget)",
+                "Model - Optimal Threshold"),
+  Customers = c(500, 500, opt_n),
+  Cost      = c(rand_cost,     cost_500,     opt_cost),
+  Renewals  = c(rand_renewals, renewals_500, opt_renewals),
+  Revenue   = c(rand_revenue,  revenue_500,  opt_revenue),
+  Profit    = c(rand_profit,   profit_500,   opt_profit)
+)
+kable(strategy_tbl,
+      col.names = c("Strategy", "Customers", "Cost (\u00A3)",
+                    "Renewals", "Revenue (\u00A3)", "Profit (\u00A3)"),
+      caption   = "Business Strategy Comparison - Test Set",
+      digits    = 0,
+      format.args = list(big.mark = ",")) %>%
+  kable_styling(full_width = FALSE) %>%
+  row_spec(1, italic = TRUE, background = "#F5F5F5") %>%
+  row_spec(3, bold = TRUE, background = "#D5F5E3")
+```
+
+---
